@@ -1,0 +1,7 @@
+{
+  "uuid": "blackshark@blacksharkv2pro.dev",
+  "name": "BlackShark V2 Pro",
+  "description": "Battery indicator and quick settings for the Razer BlackShark V2 Pro 2.4 wireless headset (via OpenRazer): equalizer preset, auto power-off, mic monitoring and Bluetooth do-not-disturb.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "url": ""
+}

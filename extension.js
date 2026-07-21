@@ -17,6 +17,12 @@ import * as Slider from 'resource:///org/gnome/shell/ui/slider.js';
 
 const BUS = 'org.razer';
 const POLL_SECONDS = 30;
+// The mute button is a physical control on the earcup, so poll it more often
+// than the battery - a 30 s lag on a mute indicator is useless. Each read is
+// a couple of short USB exchanges, so this stays cheap.
+const MUTE_POLL_SECONDS = 5;
+// Shown next to the headset icon only while the mic is muted on the device.
+const MIC_MUTED_ICON = 'microphone-disabled-symbolic';
 
 const PRESETS = [
     ['game', 'Game'],
@@ -61,12 +67,25 @@ class BlacksharkIndicator extends PanelMenu.Button {
         this._devicePath = null;
         this._updatingUi = false;
         this._micLevelTimeout = null;
+        // Sidetone is a single 0-100 value in the daemon API where 0 means
+        // off; the daemon scales it to the headset's own range.
+        // The menu splits it into a switch and a slider, so remember the last
+        // non-zero level to restore when the switch goes back on.
+        this._sidetoneLevel = 70;
 
         const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
         box.add_child(new St.Icon({
             icon_name: 'audio-headset-symbolic',
             style_class: 'system-status-icon',
         }));
+        // Struck-through mic, visible only while the headset's own mute
+        // button is engaged. Sits between the headset icon and the battery.
+        this._muteIcon = new St.Icon({
+            icon_name: MIC_MUTED_ICON,
+            style_class: 'system-status-icon',
+            visible: false,
+        });
+        box.add_child(this._muteIcon);
         this._label = new St.Label({
             text: '…',
             y_align: Clutter.ActorAlign.CENTER,
@@ -82,8 +101,13 @@ class BlacksharkIndicator extends PanelMenu.Button {
 
         this.visible = false;
         this._refreshBattery().catch(() => {});
+        this._refreshMuteIcon().catch(() => {});
         this._poll = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
             this._refreshBattery().catch(() => {});
+            return GLib.SOURCE_CONTINUE;
+        });
+        this._mutePoll = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, MUTE_POLL_SECONDS, () => {
+            this._refreshMuteIcon().catch(() => {});
             return GLib.SOURCE_CONTINUE;
         });
     }
@@ -117,20 +141,19 @@ class BlacksharkIndicator extends PanelMenu.Button {
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        this._micSwitch = new PopupMenu.PopupSwitchMenuItem('Mic monitoring', false);
+        this._micSwitch = new PopupMenu.PopupSwitchMenuItem('Sidetone', false);
         // keep the menu open when toggling
         this._micSwitch.activate = () => this._micSwitch.toggle();
         this._micSwitch.connect('toggled', (_item, state) => {
             if (this._updatingUi || !this._devicePath)
                 return;
-            dbusCall(this._devicePath, 'razer.device.audio', 'setMicMonitoring',
-                new GLib.Variant('(b)', [state])).catch(() => {});
+            this._setSidetone(state ? this._sidetoneLevel : 0);
         });
         this.menu.addMenuItem(this._micSwitch);
 
         const levelItem = new PopupMenu.PopupBaseMenuItem({activate: false});
         levelItem.add_child(new St.Label({
-            text: 'Monitoring level',
+            text: 'Sidetone level',
             y_align: Clutter.ActorAlign.CENTER,
         }));
         this._micSlider = new Slider.Slider(0.7);
@@ -142,22 +165,28 @@ class BlacksharkIndicator extends PanelMenu.Button {
                 GLib.source_remove(this._micLevelTimeout);
             this._micLevelTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
                 this._micLevelTimeout = null;
-                const level = Math.round(this._micSlider.value * 10);
-                dbusCall(this._devicePath, 'razer.device.audio', 'setMicMonitoringLevel',
-                    new GLib.Variant('(y)', [level])).catch(() => {});
+                const level = Math.round(this._micSlider.value * 100);
+                if (level > 0) {
+                    this._sidetoneLevel = level;
+                    // moving the slider implies "on"
+                    this._updatingUi = true;
+                    this._micSwitch.setToggleState(true);
+                    this._updatingUi = false;
+                }
+                this._setSidetone(level);
                 return GLib.SOURCE_REMOVE;
             });
         });
         levelItem.add_child(this._micSlider);
         this.menu.addMenuItem(levelItem);
 
-        this._dndSwitch = new PopupMenu.PopupSwitchMenuItem('Bluetooth do not disturb', false);
+        this._dndSwitch = new PopupMenu.PopupSwitchMenuItem('Do not disturb', false);
         // keep the menu open when toggling
         this._dndSwitch.activate = () => this._dndSwitch.toggle();
         this._dndSwitch.connect('toggled', (_item, state) => {
             if (this._updatingUi || !this._devicePath)
                 return;
-            dbusCall(this._devicePath, 'razer.device.misc', 'setBluetoothDnd',
+            dbusCall(this._devicePath, 'razer.device.misc', 'setDnd',
                 new GLib.Variant('(b)', [state])).catch(() => {});
         });
         this.menu.addMenuItem(this._dndSwitch);
@@ -166,7 +195,12 @@ class BlacksharkIndicator extends PanelMenu.Button {
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
             const guiItem = new PopupMenu.PopupMenuItem('Open control app');
             guiItem.connect('activate', () => {
-                GLib.spawn_command_line_async('blackshark-gui');
+                try {
+                    Gio.Subprocess.new(['blackshark-gui'],
+                        Gio.SubprocessFlags.NONE);
+                } catch (_e) {
+                    // app not installed or not launchable; nothing to do
+                }
             });
             this.menu.addMenuItem(guiItem);
         }
@@ -199,8 +233,32 @@ class BlacksharkIndicator extends PanelMenu.Button {
         } catch (_e) {
             // headset off/unplugged (or daemon down): hide, rediscover on the next poll
             this._devicePath = null;
+            this._muteIcon.visible = false;
             this.visible = false;
         }
+    }
+
+    /* Track the headset's own mute button (read-only on the device) and show
+     * the struck-through mic in the panel while it is engaged. */
+    async _refreshMuteIcon() {
+        if (!this._devicePath) {
+            this._muteIcon.visible = false;
+            return;
+        }
+        try {
+            const [muted] = await dbusCall(this._devicePath, 'razer.device.audio', 'getMicMute');
+            this._muteIcon.visible = !!muted;
+        } catch (_e) {
+            // older daemon without getMicMute, or the headset went away
+            this._muteIcon.visible = false;
+        }
+    }
+
+    _setSidetone(level) {
+        if (!this._devicePath)
+            return;
+        dbusCall(this._devicePath, 'razer.device.audio', 'setSidetone',
+            new GLib.Variant('(y)', [level])).catch(() => {});
     }
 
     async _refreshMenu() {
@@ -222,13 +280,13 @@ class BlacksharkIndicator extends PanelMenu.Button {
                     ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
             }
 
-            const [mic] = await dbusCall(this._devicePath, 'razer.device.audio', 'getMicMonitoring');
-            this._micSwitch.setToggleState(mic);
+            const [sidetone] = await dbusCall(this._devicePath, 'razer.device.audio', 'getSidetone');
+            this._micSwitch.setToggleState(sidetone > 0);
+            if (sidetone > 0)
+                this._sidetoneLevel = sidetone;
+            this._micSlider.value = this._sidetoneLevel / 100;
 
-            const [level] = await dbusCall(this._devicePath, 'razer.device.audio', 'getMicMonitoringLevel');
-            this._micSlider.value = level / 10;
-
-            const [dnd] = await dbusCall(this._devicePath, 'razer.device.misc', 'getBluetoothDnd');
+            const [dnd] = await dbusCall(this._devicePath, 'razer.device.misc', 'getDnd');
             this._dndSwitch.setToggleState(dnd);
         } catch (_e) {
             // partial refresh is fine; battery/presence already handled
@@ -266,6 +324,10 @@ class BlacksharkIndicator extends PanelMenu.Button {
         if (this._poll) {
             GLib.source_remove(this._poll);
             this._poll = null;
+        }
+        if (this._mutePoll) {
+            GLib.source_remove(this._mutePoll);
+            this._mutePoll = null;
         }
         if (this._micLevelTimeout) {
             GLib.source_remove(this._micLevelTimeout);

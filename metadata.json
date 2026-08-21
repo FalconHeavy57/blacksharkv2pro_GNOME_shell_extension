@@ -2,6 +2,6 @@
   "uuid": "blackshark@blacksharkv2pro.dev",
   "name": "BlackShark V2 Pro",
   "description": "Battery indicator and quick settings for the Razer BlackShark V2 Pro 2.4 wireless headset (via OpenRazer): equalizer preset, auto power-off, sidetone and do-not-disturb. Shows a muted-mic icon while the headset's own mute button is engaged.",
-  "shell-version": ["45", "46", "47", "48", "49"],
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
   "url": ""
 }

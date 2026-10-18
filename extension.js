@@ -6,6 +6,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 
@@ -16,6 +17,12 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as Slider from 'resource:///org/gnome/shell/ui/slider.js';
 
 const BUS = 'org.razer';
+// USB id of the 2.4 GHz dongle; matched instead of the device name so other
+// BlackShark models OpenRazer may support later are left alone.
+const RAZER_VID = 0x1532;
+const BLACKSHARK_PID = 0x0555;
+// Installed by the BlackShark GUI (blacksharkv2pro_gui).
+const GUI_APP_ID = 'dev.blacksharkv2pro.gui.desktop';
 const POLL_SECONDS = 30;
 // The mute button is a physical control on the earcup, so poll it more often
 // than the battery - a 30 s lag on a mute indicator is useless. Each read is
@@ -44,11 +51,11 @@ const SLEEP_CHOICES = [
     [60, '60 minutes'],
 ];
 
-function dbusCall(path, iface, method, args = null) {
+function dbusCall(path, iface, method, args = null, cancellable = null) {
     return new Promise((resolve, reject) => {
         Gio.DBus.session.call(
             BUS, path, iface, method, args, null,
-            Gio.DBusCallFlags.NONE, 3000, null,
+            Gio.DBusCallFlags.NONE, 3000, cancellable,
             (conn, res) => {
                 try {
                     resolve(conn.call_finish(res).recursiveUnpack());
@@ -65,7 +72,14 @@ class BlacksharkIndicator extends PanelMenu.Button {
         super._init(0.0, 'BlackShark V2 Pro');
 
         this._devicePath = null;
+        // Cancelled in destroy(): a D-Bus call still in flight then fails
+        // instead of resolving into actors that are already gone (GNOME
+        // disables extensions on every screen lock).
+        this._cancellable = new Gio.Cancellable();
         this._updatingUi = false;
+        // Controls the user changed while a menu refresh was reading; the
+        // refresh leaves those alone instead of applying its stale value.
+        this._userEdits = new Set();
         this._micLevelTimeout = null;
         // Sidetone is a single 0-100 value in the daemon API where 0 means
         // off; the daemon scales it to the headset's own range.
@@ -113,10 +127,6 @@ class BlacksharkIndicator extends PanelMenu.Button {
     }
 
     _buildMenu() {
-        this._statusItem = new PopupMenu.PopupMenuItem('BlackShark V2 Pro', {reactive: false});
-        this.menu.addMenuItem(this._statusItem);
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
         this._presetSub = new PopupMenu.PopupSubMenuMenuItem('Equalizer preset');
         this._presetItems = new Map();
         for (const [key, label] of PRESETS) {
@@ -160,6 +170,7 @@ class BlacksharkIndicator extends PanelMenu.Button {
         this._micSlider.connect('notify::value', () => {
             if (this._updatingUi || !this._devicePath)
                 return;
+            this._userEdits.add('sidetone');
             // a drag emits many changes; debounce before writing
             if (this._micLevelTimeout)
                 GLib.source_remove(this._micLevelTimeout);
@@ -186,32 +197,34 @@ class BlacksharkIndicator extends PanelMenu.Button {
         this._dndSwitch.connect('toggled', (_item, state) => {
             if (this._updatingUi || !this._devicePath)
                 return;
-            dbusCall(this._devicePath, 'razer.device.misc', 'setDnd',
+            this._userEdits.add('dnd');
+            this._call(this._devicePath, 'razer.device.misc', 'setDnd',
                 new GLib.Variant('(b)', [state])).catch(() => {});
         });
         this.menu.addMenuItem(this._dndSwitch);
 
-        if (GLib.find_program_in_path('blackshark-gui')) {
+        // Launch through the shell's app system rather than spawning the
+        // binary: the GUI then gets its own scope, launch feedback and
+        // focus-the-existing-window, like any app started from the dash.
+        const guiApp = Shell.AppSystem.get_default().lookup_app(GUI_APP_ID);
+        if (guiApp) {
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
             const guiItem = new PopupMenu.PopupMenuItem('Open control app');
-            guiItem.connect('activate', () => {
-                try {
-                    Gio.Subprocess.new(['blackshark-gui'],
-                        Gio.SubprocessFlags.NONE);
-                } catch (_e) {
-                    // app not installed or not launchable; nothing to do
-                }
-            });
+            guiItem.connect('activate', () => guiApp.activate());
             this.menu.addMenuItem(guiItem);
         }
     }
 
+    _call(path, iface, method, args = null) {
+        return dbusCall(path, iface, method, args, this._cancellable);
+    }
+
     async _findDevice() {
-        const [serials] = await dbusCall('/org/razer', 'razer.devices', 'getDevices');
+        const [serials] = await this._call('/org/razer', 'razer.devices', 'getDevices');
         for (const serial of serials) {
             const path = `/org/razer/device/${serial}`;
-            const [name] = await dbusCall(path, 'razer.device.misc', 'getDeviceName');
-            if (name.includes('BlackShark'))
+            const [[vid, pid]] = await this._call(path, 'razer.device.misc', 'getVidPid');
+            if (vid === RAZER_VID && pid === BLACKSHARK_PID)
                 return path;
         }
         return null;
@@ -224,13 +237,14 @@ class BlacksharkIndicator extends PanelMenu.Button {
             if (!this._devicePath)
                 throw new Error('no device');
 
-            const [battery] = await dbusCall(this._devicePath, 'razer.device.power', 'getBattery');
-            const [charging] = await dbusCall(this._devicePath, 'razer.device.power', 'isCharging');
+            const [battery] = await this._call(this._devicePath, 'razer.device.power', 'getBattery');
+            const [charging] = await this._call(this._devicePath, 'razer.device.power', 'isCharging');
             this._label.text = `${Math.round(battery)}%${charging ? ' ⚡' : ''}`;
-            this._statusItem.label.text =
-                `BlackShark V2 Pro — battery ${Math.round(battery)}%${charging ? ', charging' : ''}`;
             this.visible = true;
         } catch (_e) {
+            // disabled mid-call: the actors are gone, leave them alone
+            if (this._cancellable.is_cancelled())
+                return;
             // headset off/unplugged (or daemon down): hide, rediscover on the next poll
             this._devicePath = null;
             this._muteIcon.visible = false;
@@ -246,9 +260,12 @@ class BlacksharkIndicator extends PanelMenu.Button {
             return;
         }
         try {
-            const [muted] = await dbusCall(this._devicePath, 'razer.device.audio', 'getMicMute');
+            const [muted] = await this._call(this._devicePath, 'razer.device.audio', 'getMicMute');
             this._muteIcon.visible = !!muted;
         } catch (_e) {
+            // disabled mid-call: the actors are gone, leave them alone
+            if (this._cancellable.is_cancelled())
+                return;
             // older daemon without getMicMute, or the headset went away
             this._muteIcon.visible = false;
         }
@@ -257,39 +274,63 @@ class BlacksharkIndicator extends PanelMenu.Button {
     _setSidetone(level) {
         if (!this._devicePath)
             return;
-        dbusCall(this._devicePath, 'razer.device.audio', 'setSidetone',
+        this._userEdits.add('sidetone');
+        this._call(this._devicePath, 'razer.device.audio', 'setSidetone',
             new GLib.Variant('(y)', [level])).catch(() => {});
     }
 
     async _refreshMenu() {
         await this._refreshBattery();
-        if (!this._devicePath)
+        if (!this._devicePath || this._cancellable.is_cancelled())
             return;
+
+        // Read everything first, then apply it in one synchronous block:
+        // _updatingUi mutes the switch/slider handlers, so holding it across
+        // the D-Bus round trips would silently drop a toggle made meanwhile.
+        this._userEdits.clear();
+        const path = this._devicePath;
+        const [preset, idle, sidetone, dnd] = await Promise.allSettled([
+            this._call(path, 'razer.device.audio', 'getEqualizerPreset'),
+            this._call(path, 'razer.device.power', 'getIdleTime'),
+            this._call(path, 'razer.device.audio', 'getSidetone'),
+            this._call(path, 'razer.device.misc', 'getDnd'),
+        ]);
+        if (this._cancellable.is_cancelled())
+            return;
+
+        // a failed read leaves its control as it was, and so does a control
+        // the user changed while the reads were in flight
+        const fresh = (result, control) =>
+            result.status === 'fulfilled' && !this._userEdits.has(control);
+
         this._updatingUi = true;
         try {
-            const [preset] = await dbusCall(this._devicePath, 'razer.device.audio', 'getEqualizerPreset');
-            for (const [key, item] of this._presetItems) {
-                item.setOrnament(key === preset
-                    ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
+            if (fresh(preset, 'preset')) {
+                const [active] = preset.value;
+                for (const [key, item] of this._presetItems) {
+                    item.setOrnament(key === active
+                        ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
+                }
             }
 
-            const [seconds] = await dbusCall(this._devicePath, 'razer.device.power', 'getIdleTime');
-            const minutes = Math.round(seconds / 60);
-            for (const [choice, item] of this._sleepItems) {
-                item.setOrnament(choice === minutes
-                    ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
+            if (fresh(idle, 'sleep')) {
+                const minutes = Math.round(idle.value[0] / 60);
+                for (const [choice, item] of this._sleepItems) {
+                    item.setOrnament(choice === minutes
+                        ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
+                }
             }
 
-            const [sidetone] = await dbusCall(this._devicePath, 'razer.device.audio', 'getSidetone');
-            this._micSwitch.setToggleState(sidetone > 0);
-            if (sidetone > 0)
-                this._sidetoneLevel = sidetone;
-            this._micSlider.value = this._sidetoneLevel / 100;
+            if (fresh(sidetone, 'sidetone')) {
+                const [level] = sidetone.value;
+                this._micSwitch.setToggleState(level > 0);
+                if (level > 0)
+                    this._sidetoneLevel = level;
+                this._micSlider.value = this._sidetoneLevel / 100;
+            }
 
-            const [dnd] = await dbusCall(this._devicePath, 'razer.device.misc', 'getDnd');
-            this._dndSwitch.setToggleState(dnd);
-        } catch (_e) {
-            // partial refresh is fine; battery/presence already handled
+            if (fresh(dnd, 'dnd'))
+                this._dndSwitch.setToggleState(dnd.value[0]);
         } finally {
             this._updatingUi = false;
         }
@@ -298,12 +339,13 @@ class BlacksharkIndicator extends PanelMenu.Button {
     _setPreset(key) {
         if (!this._devicePath)
             return;
+        this._userEdits.add('preset');
         // optimistic check-mark; the write is confirmed by the next refresh
         for (const [k, item] of this._presetItems) {
             item.setOrnament(k === key
                 ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
         }
-        dbusCall(this._devicePath, 'razer.device.audio', 'setEqualizerPreset',
+        this._call(this._devicePath, 'razer.device.audio', 'setEqualizerPreset',
             new GLib.Variant('(s)', [key]))
             .catch(() => this._refreshMenu().catch(() => {}));
     }
@@ -311,16 +353,18 @@ class BlacksharkIndicator extends PanelMenu.Button {
     _setSleep(minutes) {
         if (!this._devicePath)
             return;
+        this._userEdits.add('sleep');
         for (const [choice, item] of this._sleepItems) {
             item.setOrnament(choice === minutes
                 ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
         }
-        dbusCall(this._devicePath, 'razer.device.power', 'setIdleTime',
+        this._call(this._devicePath, 'razer.device.power', 'setIdleTime',
             new GLib.Variant('(q)', [minutes * 60]))
             .catch(() => this._refreshMenu().catch(() => {}));
     }
 
     destroy() {
+        this._cancellable.cancel();
         if (this._poll) {
             GLib.source_remove(this._poll);
             this._poll = null;

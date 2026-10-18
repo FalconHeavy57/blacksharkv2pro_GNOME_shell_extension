@@ -88,3 +88,7 @@ a GNOME platform limitation); iterate in the nested shell instead and relogin on
 
 GPL-2.0-or-later (see `LICENSE`) — the license GNOME Shell itself uses, and the one
 extensions.gnome.org expects for published extensions.
+
+## Disclaimer
+
+⚠️ Built with AI assistance. Provided as-is, without warranty. Use at your own risk.
